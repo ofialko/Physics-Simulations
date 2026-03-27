@@ -1,0 +1,5 @@
+{
+  "name": "Physics Wedge & Incline Simulator",
+  "description": "An interactive physics simulation of a wedge sliding down an inclined plane with a glass of water, demonstrating effective gravity and fluid surface orientation.",
+  "requestFramePermissions": []
+}
