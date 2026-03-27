@@ -25,6 +25,7 @@ interface SimulationState {
   m: number;     // Combined mass of wedge, glass, and water
   g: number;     // Gravity
   mu: number;    // Friction coefficient between wedge and plane
+  muGround: number; // Friction coefficient between plane and ground
   isFixed: boolean;
   isSimulating: boolean;
   time: number;
@@ -50,6 +51,7 @@ const INITIAL_STATE: SimulationState = {
   m: 2,
   g: 9.81,
   mu: 0.1,
+  muGround: 0.05,
   isFixed: true,
   isSimulating: false,
   time: 0,
@@ -80,42 +82,41 @@ export default function App() {
       const sinA = Math.sin(alphaRad);
       const cosA = Math.cos(alphaRad);
       
-      let accS = 0;
-      let accX = 0;
-
-      // Only calculate wedge acceleration if simulating
-      if (prev.isSimulating) {
-        if (prev.isFixed) {
-          accS = Math.max(0, prev.g * (sinA - prev.mu * cosA));
-          accX = 0;
-        } else {
-          if (sinA > prev.mu * cosA) {
-            const numeratorX = -prev.m * prev.g * cosA * (sinA - prev.mu * cosA);
-            const denominatorX = prev.M + prev.m * sinA * sinA - prev.mu * prev.m * sinA * cosA;
-            accX = numeratorX / denominatorX;
-            accS = prev.g * (sinA - prev.mu * cosA) + accX * (cosA + prev.mu * sinA);
-          } else {
-            accX = 0;
-            accS = 0;
-          }
-        }
-      }
-
-      // Handle dragging acceleration
-      let effectiveAccX = accX;
+      // 1. Determine effective horizontal acceleration of M (effectiveAccX)
+      let effectiveAccX = 0;
       let nextVX = prev.vX;
       let nextX = prev.X;
 
       if (prev.isDragging) {
-        const dragStiffness = 300;
-        const dragDamping = 15;
-        const dragForce = dragStiffness * (prev.targetX - prev.X) - dragDamping * prev.vX;
+        const dragStiffness = 150;
+        const dragDamping = 20;
+        let dragForce = dragStiffness * (prev.targetX - prev.X) - dragDamping * prev.vX;
+        const maxDragAcc = 500;
+        dragForce = Math.max(-maxDragAcc, Math.min(maxDragAcc, dragForce));
         effectiveAccX = dragForce;
         nextVX = prev.vX + effectiveAccX * dt;
         nextX = prev.X + nextVX * dt;
-      } else if (prev.isSimulating) {
-        nextVX = prev.vX + accX * dt;
-        nextX = prev.X + prev.vX * dt + 0.5 * accX * dt * dt;
+      } else if (prev.isSimulating && !prev.isFixed) {
+        let rawAccX = 0;
+        if (sinA > prev.mu * cosA) {
+          const numeratorX = -prev.m * prev.g * cosA * (sinA - prev.mu * cosA);
+          const denominatorX = prev.M + prev.m * sinA * sinA - prev.mu * prev.m * sinA * cosA;
+          rawAccX = numeratorX / denominatorX;
+        }
+        
+        // Ground friction
+        const groundFrictionAcc = prev.muGround * prev.g * (prev.M + prev.m) / prev.M;
+        if (Math.abs(rawAccX) > groundFrictionAcc) {
+          effectiveAccX = rawAccX - Math.sign(rawAccX) * groundFrictionAcc;
+        } else if (Math.abs(prev.vX) > 0.1) {
+          effectiveAccX = -Math.sign(prev.vX) * groundFrictionAcc;
+        } else {
+          effectiveAccX = 0;
+          nextVX = 0;
+        }
+        
+        nextVX = nextVX + effectiveAccX * dt;
+        nextX = prev.X + prev.vX * dt + 0.5 * effectiveAccX * dt * dt;
       } else {
         const stopDamping = 10;
         effectiveAccX = -prev.vX * stopDamping;
@@ -124,25 +125,66 @@ export default function App() {
         nextX = prev.X + nextVX * dt;
       }
 
-      // Update wedge positions
-      const nextVs = prev.isSimulating ? prev.vs + accS * dt : 0;
-      const nextS = prev.isSimulating ? prev.s + prev.vs * dt + 0.5 * accS * dt * dt : prev.s;
+      // 2. Determine acceleration of m along incline (accS)
+      let accS = 0;
+      // m moves if simulating OR if being dragged (external force)
+      if (prev.isSimulating || prev.isDragging) {
+        // Formula: accS = g(sinA - mu*cosA) - effectiveAccX(cosA + mu*sinA)
+        // We calculate driving force and normal force to handle static friction
+        const drivingForce = prev.g * sinA - effectiveAccX * cosA;
+        const normalForce = prev.g * cosA + effectiveAccX * sinA;
+        
+        const N = Math.max(0, normalForce);
+        const frictionMax = prev.mu * N;
+        
+        if (Math.abs(drivingForce) > frictionMax) {
+           accS = drivingForce - Math.sign(drivingForce) * frictionMax;
+        } else if (Math.abs(prev.vs) > 0.1) {
+           accS = drivingForce - Math.sign(prev.vs) * frictionMax;
+        } else {
+           accS = 0;
+        }
+      } else {
+        const stopDampingS = 10;
+        accS = -prev.vs * stopDampingS;
+      }
+
+      // 3. Update wedge positions
+      let nextVs = prev.vs + accS * dt;
+      if (!prev.isSimulating && !prev.isDragging && Math.abs(nextVs) < 0.1) nextVs = 0;
+      const nextS = prev.s + nextVs * dt;
       
       // Calculate target surface angle
       const ax = effectiveAccX + accS * cosA;
       const ay = accS * sinA;
-      const targetAngle = Math.atan2(ax, prev.g - ay);
+      let targetAngle = Math.atan2(ax, prev.g - ay);
+
+      // Physical limits of the glass (atan(glassHeight / glassWidth))
+      // glassWidth = 40, glassHeight = 60, waterLevel = 0.5
+      const maxAngle = Math.atan(1.5);
+      targetAngle = Math.max(-maxAngle, Math.min(maxAngle, targetAngle));
 
       // Sloshing physics (Damped Harmonic Oscillator for the angle)
       // This runs ALWAYS, even when paused
-      const stiffness = 40; 
-      const damping = 6;    
+      const stiffness = 20; 
+      const damping = 8;    
       
       const angleDiff = targetAngle - prev.surfaceAngle;
-      const angularAcc = stiffness * angleDiff - damping * prev.surfaceAngularVel;
+      let angularAcc = stiffness * angleDiff - damping * prev.surfaceAngularVel;
+      
+      // Cap angular acceleration to prevent violent snapping
+      const maxAngularAcc = 10;
+      angularAcc = Math.max(-maxAngularAcc, Math.min(maxAngularAcc, angularAcc));
       
       const nextAngularVel = prev.surfaceAngularVel + angularAcc * dt;
-      const nextSurfaceAngle = prev.surfaceAngle + prev.surfaceAngularVel * dt;
+      let nextSurfaceAngle = prev.surfaceAngle + nextAngularVel * dt;
+
+      // Clamp surface angle to vessel boundaries
+      if (nextSurfaceAngle > maxAngle) {
+        nextSurfaceAngle = maxAngle;
+      } else if (nextSurfaceAngle < -maxAngle) {
+        nextSurfaceAngle = -maxAngle;
+      }
 
       // Boundary check - stop if it hits the ground or goes off top
       let isSimulating = prev.isSimulating;
@@ -396,6 +438,7 @@ export default function App() {
       m: prev.m,
       g: prev.g,
       mu: prev.mu,
+      muGround: prev.muGround,
       isFixed: prev.isFixed
     }));
   };
@@ -554,13 +597,27 @@ export default function App() {
               {/* Friction mu */}
               <div className="space-y-4">
                 <div className="flex justify-between items-center">
-                  <label className="text-sm font-medium text-slate-700">Friction (μ)</label>
+                  <label className="text-sm font-medium text-slate-700">Wedge Friction (μ)</label>
                   <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded">{state.mu.toFixed(2)}</span>
                 </div>
                 <input 
                   type="range" min="0" max="1" step="0.01"
                   value={state.mu}
                   onChange={(e) => setState(s => ({ ...s, mu: Number(e.target.value) }))}
+                  className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                />
+              </div>
+
+              {/* Ground Friction muGround */}
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <label className="text-sm font-medium text-slate-700">Ground Friction (μ_g)</label>
+                  <span className="text-xs font-mono bg-slate-100 px-2 py-1 rounded">{state.muGround.toFixed(2)}</span>
+                </div>
+                <input 
+                  type="range" min="0" max="1" step="0.01"
+                  value={state.muGround}
+                  onChange={(e) => setState(s => ({ ...s, muGround: Number(e.target.value) }))}
                   className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600"
                 />
               </div>
@@ -653,7 +710,7 @@ export default function App() {
                     <strong>Observation:</strong> In a frictionless system, the effective gravity is always perpendicular to the incline.
                   </p>
                   <p className="text-[11px] text-blue-800 leading-normal">
-                    <strong>Tip:</strong> You can click and drag the large support (M) to move it horizontally.
+                    <strong>Tip:</strong> You can click and drag the large support (M) to move it horizontally. Ground friction (μ_g) will oppose the motion of M.
                   </p>
                 </div>
               </div>
